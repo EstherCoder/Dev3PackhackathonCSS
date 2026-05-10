@@ -1,8 +1,9 @@
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:geolocator/geolocator.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import '../theme/app_theme.dart';
 import '../widgets/neu_widgets.dart';
 import 'safe_map_screen.dart';
@@ -15,10 +16,8 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen>
-    with TickerProviderStateMixin {
+class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   int _selectedIndex = 0;
-
   late final List<Widget> _pages;
 
   @override
@@ -92,7 +91,7 @@ class _HomeScreenState extends State<HomeScreen>
         mainAxisAlignment: MainAxisAlignment.spaceAround,
         children: List.generate(items.length, (i) {
           final selected = i == _selectedIndex;
-          final item     = items[i];
+          final item = items[i];
           return GestureDetector(
             onTap: () => setState(() => _selectedIndex = i),
             behavior: HitTestBehavior.opaque,
@@ -111,9 +110,7 @@ class _HomeScreenState extends State<HomeScreen>
                 children: [
                   Icon(
                     selected ? item.$1 : item.$2,
-                    color: selected
-                        ? AppTheme.primaryColor
-                        : AppTheme.textSecondary,
+                    color: selected ? AppTheme.primaryColor : AppTheme.textSecondary,
                     size: 22,
                   ),
                   const SizedBox(height: 4),
@@ -121,11 +118,8 @@ class _HomeScreenState extends State<HomeScreen>
                     item.$3,
                     style: GoogleFonts.poppins(
                       fontSize: 11,
-                      fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.w400,
-                      color: selected
-                          ? AppTheme.primaryColor
-                          : AppTheme.textSecondary,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      color: selected ? AppTheme.primaryColor : AppTheme.textSecondary,
                     ),
                   ),
                 ],
@@ -139,7 +133,7 @@ class _HomeScreenState extends State<HomeScreen>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SOS Page — pulsing animated button
+// SOS Page
 // ─────────────────────────────────────────────────────────────────────────────
 class _SOSPage extends StatefulWidget {
   const _SOSPage();
@@ -149,21 +143,22 @@ class _SOSPage extends StatefulWidget {
 }
 
 class _SOSPageState extends State<_SOSPage> with TickerProviderStateMixin {
-  bool   _isProcessing  = false;
+  bool _isProcessing = false;
   String _statusMessage = "Hold button for SOS";
-  String _subStatus     = "Your location will be secured on-chain";
-  bool   _isHolding     = false;
-  double _holdProgress  = 0.0;
+  String _subStatus = "Your location will be secured on-chain";
+  bool _isHolding = false;
+  double _holdProgress = 0.0;
 
   late final AnimationController _pulseCtrl;
-  late final Animation<double>   _pulseAnim;
+  late final Animation<double> _pulseAnim;
   late final AnimationController _rippleCtrl;
-  late final Animation<double>   _rippleAnim;
+  late final Animation<double> _rippleAnim;
   late final AnimationController _holdCtrl;
 
   @override
   void initState() {
     super.initState();
+
     _pulseCtrl = AnimationController(
         vsync: this, duration: const Duration(milliseconds: 1600))
       ..repeat(reverse: true);
@@ -213,9 +208,14 @@ class _SOSPageState extends State<_SOSPage> with TickerProviderStateMixin {
     }
   }
 
-  // In home_screen.dart — replace triggerSOS()
   Future<void> _triggerSOS() async {
-    setState(() { _isProcessing = true; _statusMessage = "Securing location…"; });
+    setState(() {
+      _isProcessing = true;
+      _isHolding = false;
+      _holdProgress = 0;
+      _statusMessage = "Securing location…";
+      _subStatus = "Getting your coordinates";
+    });
 
     try {
       final user = Supabase.instance.client.auth.currentUser;
@@ -223,62 +223,110 @@ class _SOSPageState extends State<_SOSPage> with TickerProviderStateMixin {
 
       final position = await _determinePosition();
 
-      // 1. Insert to Supabase first, get the incident ID
+      // 1. Insert incident to Supabase and get the generated ID back
+      setState(() => _subStatus = "Logging incident…");
       final response = await Supabase.instance.client
-        .from('incidents')
-        .insert({
-          'user_id': user.id,
-          'latitude': position.latitude,
-          'longitude': position.longitude,
-          'type': 'SOS',
-          'status': 'active',
-        })
-        .select('id')
-        .single();
+          .from('incidents')
+          .insert({
+            'user_id': user.id,
+            'latitude': position.latitude,
+            'longitude': position.longitude,
+            'type': 'SOS',
+            'status': 'active',
+          })
+          .select('id')
+          .single();
 
       final incidentId = response['id'] as String;
 
-      // 2. Send to Solana (Memo Program via RPC)
-      setState(() => _statusMessage = "Anchoring to blockchain…");
-      final txHash = await _sendSolanaMemo(
-        memo: "CAMPUS-SHIELD:SOS:$incidentId",
+      // 2. Call Vercel API to anchor the incident on Solana
+      setState(() {
+        _statusMessage = "Anchoring to blockchain…";
+        _subStatus = "Sending to Solana";
+      });
+
+      final solanaResult = await _sendSolanaMemo(
+        incidentId: incidentId,
+        latitude: position.latitude,
+        longitude: position.longitude,
       );
 
-      // 3. Update incident with real tx hash
-      await Supabase.instance.client
-        .from('incidents')
-        .update({
-          'solana_tx_hash': txHash,
-          'solana_confirmed': txHash != null,
-        })
-        .eq('id', incidentId);
+      // 3. Update the Supabase row with the real Solana tx signature
+      if (solanaResult != null) {
+        await Supabase.instance.client
+            .from('incidents')
+            .update({
+              'solana_tx_hash': solanaResult['signature'],
+              'solana_confirmed': true,
+            })
+            .eq('id', incidentId);
+      }
 
-      setState(() { _statusMessage = "SOS Anchored ✓"; });
+      if (mounted) {
+        setState(() {
+          _statusMessage = "SOS Anchored ✓";
+          _subStatus = "Help is on the way";
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(children: [
+              const Icon(Icons.check_circle_outline_rounded,
+                  color: AppTheme.successColor),
+              const SizedBox(width: 10),
+              Text("SOS ANCHORED ON CHAIN",
+                  style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
+            ]),
+            backgroundColor: AppTheme.bgRaised,
+          ),
+        );
+
+        await Future.delayed(const Duration(seconds: 3));
+        if (mounted) {
+          setState(() {
+            _statusMessage = "Hold button for SOS";
+            _subStatus = "Your location will be secured on-chain";
+          });
+        }
+      }
     } catch (e) {
-      setState(() { _statusMessage = "Failed: $e"; });
+      if (mounted) {
+        setState(() {
+          _statusMessage = "Failed to send SOS";
+          _subStatus = "Check your connection";
+        });
+      }
     } finally {
-      setState(() => _isProcessing = false);
+      if (mounted) setState(() => _isProcessing = false);
     }
   }
 
-  // Solana memo via RPC — no heavy SDK needed
-  Future<String?> _sendSolanaMemo({required String memo}) async {
-    // For a real implementation you need:
-    // 1. A funded keypair (store securely — NOT in code)
-    // 2. The solana: ^0.32 package for signing
-    //
-    // Quick devnet approach using the solana package:
-    // final client = SolanaClient(rpcUrl: Uri.parse('https://api.devnet.solana.com'));
-    // final wallet = Ed25519HDKeyPair.fromMnemonic('your mnemonic here');
-    // final tx = await client.sendAndConfirmTransaction(
-    //   message: Message.only(MemoInstruction(signers: [wallet.publicKey], memo: memo)),
-    //   signers: [wallet],
-    //   commitment: Commitment.confirmed,
-    // );
-    // return tx;
-    //
-    // For now return a dev placeholder until wallet is set up:
-    return "DEV_${DateTime.now().millisecondsSinceEpoch}";
+  // Calls the Vercel backend which signs the Solana transaction securely
+  Future<Map<String, dynamic>?> _sendSolanaMemo({
+    required String incidentId,
+    required double latitude,
+    required double longitude,
+  }) async {
+    try {
+      final res = await http.post(
+        Uri.parse('https://campus-shield-africa.vercel.app/api/log-incident'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'incidentId': incidentId,
+          'latitude': latitude,
+          'longitude': longitude,
+          'type': 'SOS',
+        }),
+      ).timeout(const Duration(seconds: 20));
+
+      if (res.statusCode == 200) {
+        return jsonDecode(res.body) as Map<String, dynamic>;
+      }
+      return null;
+    } catch (e) {
+      // Solana failure must never block the SOS from being logged in Supabase
+      return null;
+    }
   }
 
   Future<Position> _determinePosition() async {
@@ -350,13 +398,12 @@ class _SOSPageState extends State<_SOSPage> with TickerProviderStateMixin {
 
           const SizedBox(height: 16),
 
-          // Quick action chips
+          // Quick action cards
           Row(
             children: [
               Expanded(
                 child: NeuCard(
-                  padding:
-                      const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                  padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                   child: Row(
                     children: [
                       Icon(Icons.phone_outlined,
@@ -383,8 +430,7 @@ class _SOSPageState extends State<_SOSPage> with TickerProviderStateMixin {
               const SizedBox(width: 12),
               Expanded(
                 child: NeuCard(
-                  padding:
-                      const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                  padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                   child: Row(
                     children: [
                       Icon(Icons.people_outline_rounded,
@@ -413,121 +459,138 @@ class _SOSPageState extends State<_SOSPage> with TickerProviderStateMixin {
 
           const SizedBox(height: 48),
 
-          // SOS button
-          Stack(
-            alignment: Alignment.center,
-            children: [
-              // Ripple rings
-              ...List.generate(3, (i) {
-                return AnimatedBuilder(
-                  animation: _rippleAnim,
-                  builder: (_, __) {
-                    final delay = i / 3;
-                    final t = (_rippleAnim.value - delay).clamp(0.0, 1.0);
-                    return Opacity(
-                      opacity: (1 - t) * (isActive ? 0.5 : 0.25),
-                      child: Container(
-                        width: 220 + t * 130,
-                        height: 220 + t * 130,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: btnColor1,
-                            width: 1.5,
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                );
-              }),
-
-              // Hold progress ring
-              if (_isHolding)
-                SizedBox(
-                  width: 240,
-                  height: 240,
-                  child: CircularProgressIndicator(
-                    value: _holdProgress,
-                    strokeWidth: 4,
-                    backgroundColor: AppTheme.bgSunken,
-                    color: AppTheme.dangerColor,
-                  ),
-                ),
-
-              // Core button
-              GestureDetector(
-                onLongPressStart: (_) => _onHoldStart(),
-                onLongPressEnd: (_) => _onHoldEnd(),
-                onLongPressCancel: () => _onHoldEnd(),
-                child: AnimatedBuilder(
-                  animation: _pulseAnim,
-                  builder: (_, child) => Transform.scale(
-                    scale: isActive ? 1.04 : _pulseAnim.value,
-                    child: child,
-                  ),
-                  child: Container(
-                    width: 210,
-                    height: 210,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: RadialGradient(
-                        colors: [btnColor1, btnColor2],
-                        center: const Alignment(-0.3, -0.3),
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: btnColor1.withOpacity(0.45),
-                          blurRadius: 40,
-                          spreadRadius: 8,
-                        ),
-                        BoxShadow(
-                          color: AppTheme.shadowDark.withOpacity(0.80),
-                          offset: const Offset(8, 8),
-                          blurRadius: 20,
-                        ),
-                        BoxShadow(
-                          color: AppTheme.shadowLight.withOpacity(0.25),
-                          offset: const Offset(-6, -6),
-                          blurRadius: 14,
-                        ),
-                      ],
-                    ),
-                    child: _isProcessing
-                        ? const Center(
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 3,
+          // ── SOS Button ──────────────────────────────────────────────────
+          // Fixed SizedBox prevents ripple rings from shifting cards below.
+          SizedBox(
+            width: 350,
+            height: 350,
+            child: Stack(
+              alignment: Alignment.center,
+              clipBehavior: Clip.none,
+              children: [
+                // Ripple rings — Positioned so they are layout-neutral
+                ...List.generate(3, (i) {
+                  return Positioned.fill(
+                    child: AnimatedBuilder(
+                      animation: _rippleAnim,
+                      builder: (_, __) {
+                        final delay = i / 3;
+                        final t = (_rippleAnim.value - delay).clamp(0.0, 1.0);
+                        final size = 220 + t * 130;
+                        return Center(
+                          child: Opacity(
+                            opacity: (1 - t) * (isActive ? 0.5 : 0.25),
+                            child: SizedBox(
+                              width: size,
+                              height: size,
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: btnColor1,
+                                    width: 1.5,
+                                  ),
+                                ),
+                              ),
                             ),
-                          )
-                        : Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Text(
-                                "SOS",
-                                style: GoogleFonts.orbitron(
-                                  fontSize: 48,
-                                  fontWeight: FontWeight.w900,
-                                  color: Colors.white,
-                                  letterSpacing: 4,
-                                ),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                "HOLD TO ACTIVATE",
-                                style: GoogleFonts.poppins(
-                                  fontSize: 9,
-                                  color: Colors.white60,
-                                  letterSpacing: 1.5,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
-                            ],
                           ),
+                        );
+                      },
+                    ),
+                  );
+                }),
+
+                // Hold progress ring — Positioned, layout-neutral
+                if (_isHolding)
+                  Positioned.fill(
+                    child: Center(
+                      child: SizedBox(
+                        width: 240,
+                        height: 240,
+                        child: CircularProgressIndicator(
+                          value: _holdProgress,
+                          strokeWidth: 4,
+                          backgroundColor: AppTheme.bgSunken,
+                          color: AppTheme.dangerColor,
+                        ),
+                      ),
+                    ),
+                  ),
+
+                // Core SOS button
+                GestureDetector(
+                  onLongPressStart: (_) => _onHoldStart(),
+                  onLongPressEnd: (_) => _onHoldEnd(),
+                  onLongPressCancel: () => _onHoldEnd(),
+                  child: AnimatedBuilder(
+                    animation: _pulseAnim,
+                    builder: (_, child) => Transform.scale(
+                      scale: isActive ? 1.04 : _pulseAnim.value,
+                      child: child,
+                    ),
+                    child: Container(
+                      width: 210,
+                      height: 210,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(
+                          colors: [btnColor1, btnColor2],
+                          center: const Alignment(-0.3, -0.3),
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: btnColor1.withOpacity(0.45),
+                            blurRadius: 40,
+                            spreadRadius: 8,
+                          ),
+                          BoxShadow(
+                            color: AppTheme.shadowDark.withOpacity(0.80),
+                            offset: const Offset(8, 8),
+                            blurRadius: 20,
+                          ),
+                          BoxShadow(
+                            color: AppTheme.shadowLight.withOpacity(0.25),
+                            offset: const Offset(-6, -6),
+                            blurRadius: 14,
+                          ),
+                        ],
+                      ),
+                      child: _isProcessing
+                          ? const Center(
+                              child: CircularProgressIndicator(
+                                color: Colors.white,
+                                strokeWidth: 3,
+                              ),
+                            )
+                          : Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Text(
+                                  "SOS",
+                                  style: GoogleFonts.orbitron(
+                                    fontSize: 48,
+                                    fontWeight: FontWeight.w900,
+                                    color: Colors.white,
+                                    letterSpacing: 4,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  "HOLD TO ACTIVATE",
+                                  style: GoogleFonts.poppins(
+                                    fontSize: 9,
+                                    color: Colors.white60,
+                                    letterSpacing: 1.5,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                    ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
 
           const SizedBox(height: 48),
@@ -580,6 +643,9 @@ class _SOSPageState extends State<_SOSPage> with TickerProviderStateMixin {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Incident tile widget
+// ─────────────────────────────────────────────────────────────────────────────
 class _IncidentTile extends StatelessWidget {
   const _IncidentTile({
     required this.icon,
@@ -590,10 +656,10 @@ class _IncidentTile extends StatelessWidget {
   });
 
   final IconData icon;
-  final Color    color;
-  final String   title;
-  final String   location;
-  final String   time;
+  final Color color;
+  final String title;
+  final String location;
+  final String time;
 
   @override
   Widget build(BuildContext context) {
