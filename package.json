@@ -1,0 +1,8 @@
+{
+  "name": "campus-shield-api",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@solana/web3.js": "^1.91.0"
+  }
+}
